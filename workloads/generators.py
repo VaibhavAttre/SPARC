@@ -1,7 +1,7 @@
 """Synthetic workload generators for the cache-policy RL project.
 
 Every generator returns a pandas DataFrame with the request schema from the
-README:  request_id, op, key, size, phase.
+README plus a timestamp column:  request_id, timestamp, op, key, size, phase.
 
 Workloads (each can be called on its own, or all together via generate_all):
 
@@ -23,6 +23,10 @@ Design notes
   a different hot set (used by the hot-set shift workload).
 * All randomness flows from a single seed, so traces are fully reproducible.
 * The `phase` column is a label for analysis only. Do not feed it to the agent.
+* `timestamp` is simulated arrival time in seconds (float, non-decreasing).
+  Gaps are exponential (Poisson arrivals) by default, or fixed with
+  arrival="constant"; `arrival_rate` is requests per simulated second.
+  Timestamps are drawn last, so they never change which keys/ops a seed makes.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-TRACE_COLUMNS = ["request_id", "op", "key", "size", "phase"]
+TRACE_COLUMNS = ["request_id", "timestamp", "op", "key", "size", "phase"]
 
 
 # --------------------------------------------------------------------------- #
@@ -52,12 +56,13 @@ def _check_common(num_requests, num_keys, write_fraction, block_size) -> None:
         raise ValueError("block_size must be >= 1")
 
 
-def _frame(keys, ops, phase, start_id: int, block_size: int) -> pd.DataFrame:
+def _frame(keys, ops, timestamps, phase, start_id: int, block_size: int) -> pd.DataFrame:
     """Assemble a trace DataFrame. `phase` may be a string or a per-row array."""
     n = len(keys)
     return pd.DataFrame(
         {
             "request_id": np.arange(start_id, start_id + n, dtype=np.int64),
+            "timestamp": np.asarray(timestamps, dtype=np.float64),
             "op": ops,
             "key": np.asarray(keys, dtype=np.int64),
             "size": np.full(n, block_size, dtype=np.int64),
@@ -70,6 +75,32 @@ def _frame(keys, ops, phase, start_id: int, block_size: int) -> pd.DataFrame:
 def _random_ops(rng: np.random.Generator, n: int, write_fraction) -> np.ndarray:
     """'W' with probability write_fraction (scalar or per-request array)."""
     return np.where(rng.random(n) < write_fraction, "W", "R")
+
+
+_ARRIVALS = ("poisson", "constant")
+
+
+def _check_arrival(arrival_rate, arrival, start_time) -> None:
+    if arrival_rate <= 0:
+        raise ValueError("arrival_rate must be > 0")
+    if arrival not in _ARRIVALS:
+        raise ValueError(f"arrival must be one of {_ARRIVALS}")
+    if start_time < 0:
+        raise ValueError("start_time must be >= 0")
+
+
+def _timestamps(rng, n: int, arrival_rate: float, arrival: str, start_time: float) -> np.ndarray:
+    """Simulated arrival times in seconds: start_time + cumulative gaps.
+
+    `start_time` is the clock just before the first request, so the first
+    timestamp is start_time plus one gap. Draw this *after* keys and ops so the
+    random stream for those is unaffected.
+    """
+    if arrival == "constant":
+        gaps = np.full(n, 1.0 / arrival_rate)
+    else:
+        gaps = rng.exponential(1.0 / arrival_rate, size=n)
+    return start_time + np.cumsum(gaps)
 
 
 def _spawn_seeds(seed: int, n: int) -> list[int]:
@@ -103,11 +134,15 @@ class ZipfConfig:
     block_size: int = 1             # fixed-size blocks for the MVP
     phase: str = "zipf"             # label for analysis only, not for the agent
     start_id: int = 0               # first request_id (for concatenating phases)
+    arrival_rate: float = 1000.0    # requests per simulated second
+    arrival: str = "poisson"        # "poisson" (random gaps) or "constant"
+    start_time: float = 0.0         # simulated clock before the first request
 
     def validate(self) -> None:
         _check_common(self.num_requests, self.num_keys, self.write_fraction, self.block_size)
         if self.alpha < 0:
             raise ValueError("alpha must be >= 0")
+        _check_arrival(self.arrival_rate, self.arrival, self.start_time)
 
 
 def zipf_probabilities(num_keys: int, alpha: float) -> np.ndarray:
@@ -139,7 +174,8 @@ def generate_zipf(config: ZipfConfig | None = None, **overrides) -> pd.DataFrame
     keys = _zipf_keys(rng, cfg.num_requests, cfg.num_keys, cfg.alpha, cfg.permute_keys)
     keys = keys + cfg.key_offset
     ops = _random_ops(rng, cfg.num_requests, cfg.write_fraction)
-    return _frame(keys, ops, cfg.phase, cfg.start_id, cfg.block_size)
+    ts = _timestamps(rng, cfg.num_requests, cfg.arrival_rate, cfg.arrival, cfg.start_time)
+    return _frame(keys, ops, ts, cfg.phase, cfg.start_id, cfg.block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +192,9 @@ def generate_temporal(
     block_size: int = 1,
     phase: str = "temporal",
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Temporal locality: recently accessed keys are likely to be accessed again.
 
@@ -166,6 +205,7 @@ def generate_temporal(
     is deliberately not skewed, so LFU has no frequency signal to exploit.
     """
     _check_common(num_requests, num_keys, write_fraction, block_size)
+    _check_arrival(arrival_rate, arrival, start_time)
     if not 0.0 <= reuse_prob <= 1.0:
         raise ValueError("reuse_prob must be in [0, 1]")
     if mean_reuse_distance < 1.0:
@@ -182,7 +222,8 @@ def generate_temporal(
 
     keys = np.asarray(keys, dtype=np.int64) + key_offset
     ops = _random_ops(rng, n, write_fraction)
-    return _frame(keys, ops, phase, start_id, block_size)
+    ts = _timestamps(rng, n, arrival_rate, arrival, start_time)
+    return _frame(keys, ops, ts, phase, start_id, block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,6 +239,9 @@ def generate_scan(
     block_size: int = 1,
     phase: str = "scan",
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Sequential scan: keys are accessed in order, each distinct.
 
@@ -209,11 +253,13 @@ def generate_scan(
     """
     span = max(1, num_requests if num_keys is None else num_keys)
     _check_common(num_requests, span, write_fraction, block_size)
+    _check_arrival(arrival_rate, arrival, start_time)
 
     rng = np.random.default_rng(seed)
     keys = (start_key + np.arange(num_requests, dtype=np.int64)) % span + key_offset
     ops = _random_ops(rng, num_requests, write_fraction)
-    return _frame(keys, ops, phase, start_id, block_size)
+    ts = _timestamps(rng, num_requests, arrival_rate, arrival, start_time)
+    return _frame(keys, ops, ts, phase, start_id, block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +276,9 @@ def generate_hot_shift(
     key_offset: int = 0,
     block_size: int = 1,
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Hot-set shift: the popular keys change partway through the trace.
 
@@ -246,6 +295,8 @@ def generate_hot_shift(
     if alpha < 0:
         raise ValueError("alpha must be >= 0")
 
+    _check_arrival(arrival_rate, arrival, start_time)
+
     rng = np.random.default_rng(seed)
     bounds = _segment_bounds(num_requests, shift_points)
     n_sets = 2 if recurring else len(bounds)
@@ -260,7 +311,8 @@ def generate_hot_shift(
         phase[start:end] = f"hot-set-{chr(ord('A') + which % 26)}"
 
     ops = _random_ops(rng, num_requests, write_fraction)
-    return _frame(keys + key_offset, ops, phase, start_id, block_size)
+    ts = _timestamps(rng, num_requests, arrival_rate, arrival, start_time)
+    return _frame(keys + key_offset, ops, ts, phase, start_id, block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -278,6 +330,9 @@ def generate_write_ramp(
     key_offset: int = 0,
     block_size: int = 1,
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Read-heavy -> write-heavy: the write fraction changes over time.
 
@@ -292,6 +347,7 @@ def generate_write_ramp(
     _check_common(num_requests, num_keys, start_write_fraction, block_size)
     if not 0.0 <= end_write_fraction <= 1.0:
         raise ValueError("end_write_fraction must be in [0, 1]")
+    _check_arrival(arrival_rate, arrival, start_time)
     if shape not in ("linear", "step"):
         raise ValueError("shape must be 'linear' or 'step'")
     if shape == "step" and not 0.0 < step_at < 1.0:
@@ -314,7 +370,8 @@ def generate_write_ramp(
     else:
         midpoint = (start_write_fraction + end_write_fraction) / 2.0
     phase = np.where(p < midpoint, "read-heavy", "write-heavy")
-    return _frame(keys, ops, phase, start_id, block_size)
+    ts = _timestamps(rng, n, arrival_rate, arrival, start_time)
+    return _frame(keys, ops, ts, phase, start_id, block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -333,6 +390,9 @@ def generate_write_dispersion(
     key_offset: int = 0,
     block_size: int = 1,
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Repeated writes -> dispersed writes.
 
@@ -350,6 +410,7 @@ def generate_write_dispersion(
     request in that part of the trace, reads included).
     """
     _check_common(num_requests, num_keys, write_fraction, block_size)
+    _check_arrival(arrival_rate, arrival, start_time)
     if not 0.0 < switch_at < 1.0:
         raise ValueError("switch_at must be in (0, 1)")
     if order not in ("repeated_first", "dispersed_first"):
@@ -380,7 +441,8 @@ def generate_write_dispersion(
     keys = np.where(is_write, write_keys, read_keys) + key_offset
     ops = np.where(is_write, "W", "R")
     phase = np.where(use_repeated, "repeated-writes", "dispersed-writes")
-    return _frame(keys, ops, phase, start_id, block_size)
+    ts = _timestamps(rng, n, arrival_rate, arrival, start_time)
+    return _frame(keys, ops, ts, phase, start_id, block_size)
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +487,9 @@ def generate_mixed(
     key_offset: int = 0,
     block_size: int = 1,
     start_id: int = 0,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
+    start_time: float = 0.0,
 ) -> pd.DataFrame:
     """Mixed phases: concatenated segments that change locality, popularity and
     read/write mix together, over one shared key universe (so the cache is not
@@ -432,9 +497,11 @@ def generate_mixed(
     its own hot set.
 
     Pass `phases=[PhaseSpec(...), ...]` for a custom schedule. A scan segment
-    wraps if its length exceeds num_keys.
+    wraps if its length exceeds num_keys. Timestamps continue across phases; give a
+    phase its own rate with PhaseSpec(..., params={"arrival_rate": 50.0}).
     """
     _check_common(num_requests, num_keys, 0.0, block_size)
+    _check_arrival(arrival_rate, arrival, start_time)
     specs = list(phases) if phases is not None else default_mixed_schedule()
     if not specs:
         raise ValueError("phases must not be empty")
@@ -451,6 +518,7 @@ def generate_mixed(
     counts = np.diff(edges)
 
     frames = []
+    clock = start_time
     for spec, count, start, sub_seed in zip(
         specs, counts, edges[:-1], _spawn_seeds(seed, len(specs))
     ):
@@ -465,12 +533,18 @@ def generate_mixed(
             block_size=block_size,
             phase=spec.label or spec.kind,
             start_id=start_id + int(start),
+            arrival_rate=arrival_rate,
+            arrival=arrival,
+            start_time=clock,
         )
         kwargs.update(spec.params)
-        frames.append(_KIND_GENERATORS[spec.kind](**kwargs))
+        frame = _KIND_GENERATORS[spec.kind](**kwargs)
+        frames.append(frame)
+        clock = float(frame["timestamp"].iloc[-1])
 
     if not frames:
-        return _frame(np.empty(0, dtype=np.int64), np.empty(0, dtype=str), "mixed", start_id, block_size)
+        return _frame(np.empty(0, dtype=np.int64), np.empty(0, dtype=str), np.empty(0),
+                      "mixed", start_id, block_size)
     return pd.concat(frames, ignore_index=True)
 
 
@@ -500,6 +574,8 @@ def generate_all(
     num_keys: int = 10_000,
     seed: int = 0,
     block_size: int = 1,
+    arrival_rate: float = 1000.0,
+    arrival: str = "poisson",
     only: Iterable[str] | None = None,
     overrides: dict[str, dict] | None = None,
 ) -> dict[str, pd.DataFrame]:
@@ -523,7 +599,8 @@ def generate_all(
     traces = {}
     for name in names:
         kwargs = dict(
-            num_requests=num_requests, num_keys=num_keys, seed=seeds[name], block_size=block_size
+            num_requests=num_requests, num_keys=num_keys, seed=seeds[name],
+            block_size=block_size, arrival_rate=arrival_rate, arrival=arrival,
         )
         if name == "scan":
             del kwargs["num_keys"]
@@ -561,6 +638,8 @@ def load_trace(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"trace is missing columns: {missing}")
     if not trace["op"].isin(["R", "W"]).all():
         raise ValueError("op column must contain only 'R' or 'W'")
+    if not trace["timestamp"].is_monotonic_increasing:
+        raise ValueError("timestamp column must be non-decreasing")
     return trace[TRACE_COLUMNS]
 
 
@@ -579,7 +658,8 @@ def split_seeds(base_seed: int = 0) -> dict[str, int]:
 def summarize(trace: pd.DataFrame) -> dict:
     """Quick descriptive stats for sanity-checking a trace."""
     if len(trace) == 0:
-        return {"requests": 0, "unique_keys": 0, "write_frac": 0.0, "top1%_share": 0.0, "phases": ""}
+        return {"requests": 0, "unique_keys": 0, "write_frac": 0.0, "top1%_share": 0.0,
+                "duration_s": 0.0, "phases": ""}
     counts = trace["key"].value_counts()
     top = max(1, int(0.01 * len(counts)))
     return {
@@ -587,6 +667,7 @@ def summarize(trace: pd.DataFrame) -> dict:
         "unique_keys": int(len(counts)),
         "write_frac": round(float((trace["op"] == "W").mean()), 3),
         "top1%_share": round(float(counts.head(top).sum() / len(trace)), 3),
+        "duration_s": round(float(trace["timestamp"].iloc[-1]), 3),
         "phases": " > ".join(trace["phase"].drop_duplicates()),
     }
 
