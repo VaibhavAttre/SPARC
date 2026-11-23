@@ -116,25 +116,27 @@ We will initially use `K = 1,000` as an **experiment parameter**, not a fixed re
 Each request should include at least:
 
 ```text
-request_id,op,key,size,phase
-0,R,17,1,hot-set-A
-1,W,42,1,hot-set-A
-2,R,17,1,hot-set-A
-3,W,17,1,hot-set-A
+request_id,timestamp,op,key,size,phase
+0,0.000,R,17,1,hot-set-A
+1,0.002,W,42,1,hot-set-A
+2,0.005,R,17,1,hot-set-A
+3,0.006,W,17,1,hot-set-A
 ```
 
+- `request_id`: position in the trace. Acts as the **logical clock** and deterministic tie-breaker for LRU/FIFO/LFU.
+- `timestamp`: non-decreasing arrival time in simulated time units (fixed spacing or Poisson arrivals for synthetic traces). Kept separate from the cost-model latency, which never rewrites it.
 - `op`: `R` (read) or `W` (write)
 - `key`: logical block/object identifier
-- `size`: object size (start with fixed-size blocks; variable size is optional)
-- `phase`: optional label used for analysis, **not given to the agent as an oracle**
+- `size`: object size (start with fixed-size blocks, `size = 1`; variable size is optional)
+- `phase`: optional label used for analysis, **never passed to the agent** (strip it before the environment builds observations)
 
 ### Per-cache-entry metadata
 
 Maintain at least:
 
 - Object/block key and cached data version (or a lightweight correctness marker)
-- Insertion order or insertion timestamp (FIFO)
-- Last-access timestamp (LRU)
+- Insertion order or insertion time (FIFO), as a logical `request_id` value
+- Last-access time (LRU), as a logical `request_id` value
 - Access count (LFU)
 - Dirty flag (write-back)
 
@@ -197,16 +199,26 @@ We model cache policy control as a **Markov decision process approximation** in 
 
 ### State / observation
 
-The presentation proposes four main state features:
+The presentation proposes four main state features, computed over the previous window of `K` requests:
 
 | Feature | Example measurement |
 |---|---|
 | **Cache hit rate** | Hits divided by requests in the previous window. |
 | **Read/write ratio** | Fraction of requests that are writes (or a bounded read/write ratio). |
-| **Access locality** | Recent reuse rate or mean reuse distance. |
+| **Access locality** | Fraction of requests whose key appeared in the previous `N` requests (cheaper than mean reuse distance). |
 | **Dirty-page ratio** | Number of dirty cached blocks divided by current cache occupancy. |
 
-**Recommended additional feature:** Include the currently active replacement and write policies in the state. Otherwise, the agent may not be able to tell whether an action incurs a switching cost. Avoid giving the agent future workload phase labels or other information unavailable at decision time.
+**Required additional features:**
+
+- **Current replacement and write policies.** Otherwise, the agent cannot tell whether an action incurs a switching cost.
+- **One skew/scan feature:** the unique-key ratio in the window (flags sequential scans) or the share of requests going to the top-k keys (flags Zipfian skew). The four core features alone barely distinguish LRU, LFU, and FIFO workloads.
+
+**Notes:**
+
+- Normalize every feature to [0, 1].
+- Tabular Q-learning needs a small state space: use about 5 features with 3-4 bins each. Six features at 5 bins each, times six current-policy combinations, is roughly 94k states, which is too many to learn from. DQN can use the full feature set.
+- Request rate (mean inter-arrival time, from `timestamp`) is an optional later feature. It matters little with fixed `K`-request windows.
+- Avoid giving the agent future workload phase labels or other information unavailable at decision time.
 
 ### Action
 
