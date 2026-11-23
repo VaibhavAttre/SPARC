@@ -678,7 +678,7 @@ def _main() -> None:
     parser.add_argument("--num-keys", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--only", nargs="+", choices=list(WORKLOADS), help="subset of workloads")
-    parser.add_argument("--out", type=Path, help="directory to write <name>.csv files into")
+    parser.add_argument("--out", default=Path("data"))
     args = parser.parse_args()
 
     traces = generate_all(args.num_requests, args.num_keys, args.seed, only=args.only)

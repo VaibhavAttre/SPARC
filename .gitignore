@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+
+# Generated data and outputs (reproducible from seeds; keep the folders via .gitkeep)
+data/*
+results/*
+!data/.gitkeep
+!results/.gitkeep
+
+# Model checkpoints
+*.pt
+*.pth
+
+# Editor / OS
+.vscode/
+.DS_Store
