@@ -9,3 +9,6 @@ torch>=2.2
 # Plots and tests
 matplotlib>=3.8
 pytest>=8.0
+
+# libCacheSim cross-check (no Windows build; install in WSL/Linux/macOS only)
+libcachesim; sys_platform != "win32"
