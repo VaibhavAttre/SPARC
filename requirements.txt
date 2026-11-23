@@ -1,0 +1,11 @@
+# Core (needed by workloads/generators.py)
+numpy>=1.26
+pandas>=2.0
+
+# RL environment and agents
+gymnasium>=0.29
+torch>=2.2
+
+# Plots and tests
+matplotlib>=3.8
+pytest>=8.0
